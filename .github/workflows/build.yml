@@ -1,0 +1,61 @@
+name: Build Linux Kernel
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "config/**"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout configuration
+        uses: actions/checkout@v4
+
+      - name: Clone Linux 6.18
+        run: |
+          git clone --depth=1 --branch v6.18 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+            linux
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            dwarves \
+            fakeroot \
+            dpkg-dev \
+            rsync
+
+      - name: Configure kernel
+        run: |
+          cd linux
+
+          cp ../config/config-6.18-ubuntu2204-ntsync .config
+
+          make olddefconfig
+
+          grep '^CONFIG_NTSYNC=' .config
+
+      - name: Build Debian packages
+        run: |
+          cd linux
+
+          make -j"$(nproc)" bindeb-pkg \
+            LOCALVERSION=-ntsync
+
+      - name: Upload kernel packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-6.18-ntsync
+          path: |
+            *.deb
