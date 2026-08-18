@@ -10,7 +10,7 @@ on:
 
 jobs:
   build:
-    name: Build Linux 6.18 with ntsync
+    name: Linux 6.18 + ntsync
     runs-on: ubuntu-24.04
 
     env:
@@ -19,13 +19,13 @@ jobs:
 
     steps:
       # ------------------------------------------------------------
-      # Checkout our repository
+      # Checkout repository
       # ------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # ------------------------------------------------------------
-      # Install kernel build dependencies
+      # Install build dependencies
       # ------------------------------------------------------------
       - name: Install build dependencies
         run: |
@@ -43,10 +43,12 @@ jobs:
             dpkg-dev \
             rsync \
             cpio \
-            kmod
+            kmod \
+            libdw-dev \
+            libcap-dev
 
       # ------------------------------------------------------------
-      # Clone Linux kernel
+      # Download Linux kernel
       # ------------------------------------------------------------
       - name: Clone Linux kernel
         run: |
@@ -58,34 +60,71 @@ jobs:
 
           cd linux
 
-          echo "Kernel source:"
+          echo "=== Kernel source ==="
           git describe --tags --always
 
       # ------------------------------------------------------------
-      # Apply configuration
+      # Configure kernel
       # ------------------------------------------------------------
       - name: Configure kernel
         run: |
           cd linux
 
+          echo "=== Copying configuration ==="
+
           cp ../config/config-6.18-ubuntu2204-ntsync .config
 
-          echo "Running olddefconfig..."
+          # ----------------------------------------------------------
+          # Remove Ubuntu/Canonical-specific certificate references.
+          #
+          # The configuration came from Ubuntu, while this is a
+          # vanilla kernel.org source tree.
+          # ----------------------------------------------------------
+
+          sed -i \
+            's|^CONFIG_SYSTEM_TRUSTED_KEYS=.*|CONFIG_SYSTEM_TRUSTED_KEYS=""|' \
+            .config
+
+          sed -i \
+            's|^CONFIG_SYSTEM_REVOCATION_KEYS=.*|CONFIG_SYSTEM_REVOCATION_KEYS=""|' \
+            .config
+
+          # ----------------------------------------------------------
+          # Let Linux 6.18 resolve any changed/obsolete symbols.
+          # ----------------------------------------------------------
+
+          echo "=== Running olddefconfig ==="
+
           make olddefconfig
 
           echo
           echo "=== Important configuration ==="
+
           grep '^CONFIG_NTSYNC=' .config || true
-          grep '^CONFIG_PREEMPT=' .config || true
           grep '^CONFIG_HZ=' .config || true
+          grep '^CONFIG_PREEMPT=' .config || true
+          grep '^CONFIG_SYSTEM_TRUSTED_KEYS=' .config || true
+          grep '^CONFIG_SYSTEM_REVOCATION_KEYS=' .config || true
+
           echo
+
+          # ----------------------------------------------------------
+          # Hard requirement for this build.
+          # ----------------------------------------------------------
 
           if ! grep -q '^CONFIG_NTSYNC=y$' .config; then
             echo "ERROR: CONFIG_NTSYNC=y is not enabled!"
             exit 1
           fi
 
+          # Make sure the Ubuntu certificate paths are gone.
+          if grep -q 'debian/canonical-certs.pem' .config; then
+            echo "ERROR: Ubuntu canonical certificate reference remains!"
+            exit 1
+          fi
+
           echo "CONFIG_NTSYNC=y confirmed."
+          echo "Kernel configuration is ready."
 
       # ------------------------------------------------------------
       # Build kernel
@@ -98,7 +137,7 @@ jobs:
           echo " Starting Linux kernel build"
           echo "========================================"
 
-          echo "CPU cores:"
+          echo "CPU threads:"
           nproc
 
           echo
@@ -143,15 +182,17 @@ jobs:
       # ------------------------------------------------------------
       - name: List generated packages
         run: |
-          echo "Generated packages:"
-          ls -lh ./*.deb || true
+          echo "=== Generated Debian packages ==="
+
+          ls -lh ../*.deb
 
           echo
-          echo "All files in parent directory:"
-          ls -lh . ../ | head -100
+          echo "=== Package names ==="
+
+          find .. -maxdepth 1 -type f -name '*.deb' -printf '%f\n'
 
       # ------------------------------------------------------------
-      # Upload Debian packages
+      # Upload kernel packages
       # ------------------------------------------------------------
       - name: Upload kernel packages
         uses: actions/upload-artifact@v4
