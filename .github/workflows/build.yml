@@ -16,43 +16,42 @@ env:
 
 jobs:
   build-kernel:
-    name: name: Build custom Linux kernel
+    name: Build Linux kernel
     runs-on: ubuntu-24.04
 
     steps:
-      # ============================================================
-      # 1. Checkout this repository
-      # ============================================================
+      # ==========================================================
+      # 1. Checkout repository
+      # ==========================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ============================================================
-      # 2. Show repository contents
-      #    Useful for diagnosing path mistakes.
-      # ============================================================
-      - name: Show repository
+      # ==========================================================
+      # 2. Show repository structure
+      # ==========================================================
+      - name: Verify repository
         shell: bash
         run: |
-          set -eux
+          set -euo pipefail
 
-          echo "Working directory:"
+          echo "Repository:"
           pwd
 
           echo
-          echo "Repository root:"
+          echo "Top-level files:"
           ls -la
 
           echo
           echo "Configuration files:"
           find config -maxdepth 2 -type f -print 2>/dev/null || true
 
-      # ============================================================
-      # 3. Install kernel build dependencies
-      # ============================================================
+      # ==========================================================
+      # 3. Install dependencies
+      # ==========================================================
       - name: Install build dependencies
         shell: bash
         run: |
-          set -eux
+          set -euo pipefail
 
           sudo apt-get update
 
@@ -63,6 +62,7 @@ jobs:
             flex \
             libssl-dev \
             libelf-dev \
+            libdw-dev \
             dwarves \
             cpio \
             rsync \
@@ -70,17 +70,19 @@ jobs:
             fakeroot \
             dpkg-dev \
             debhelper \
-            libdw-dev \
-            libcap-dev \
-            python3
+            python3 \
+            perl \
+            pahole
 
-      # ============================================================
+      # ==========================================================
       # 4. Download Linux kernel source
-      # ============================================================
-      - name: Clone Linux kernel
+      # ==========================================================
+      - name: Download Linux kernel source
         shell: bash
         run: |
-          set -eux
+          set -euo pipefail
+
+          echo "Downloading Linux ${KERNEL_VERSION}..."
 
           git clone \
             --depth=1 \
@@ -91,78 +93,80 @@ jobs:
           test -d linux
           test -f linux/Makefile
 
+          cd linux
+
           echo
           echo "Kernel source version:"
-          cd linux
           make -s kernelversion
 
-      # ============================================================
-      # 5. Locate custom configuration
-      #
-      # Expected repository layout:
-      #
-      #   config/
-      #     config-6.18-minta-ntsync
-      # ============================================================
-      - name: Locate kernel configuration
+      # ==========================================================
+      # 5. Check custom configuration
+      # ==========================================================
+      - name: Check custom configuration
         shell: bash
         run: |
-          set -eux
+          set -euo pipefail
 
           CONFIG_FILE="config/config-6.18-minta-ntsync"
 
           if [ ! -f "$CONFIG_FILE" ]; then
-            echo "ERROR: configuration file not found:"
-            echo "  $CONFIG_FILE"
+            echo "::error::Configuration file not found: $CONFIG_FILE"
             echo
-            echo "Available files:"
+            echo "Available configuration files:"
             find config -maxdepth 2 -type f -print 2>/dev/null || true
             exit 1
           fi
 
-          echo "Using configuration:"
-          echo "  $CONFIG_FILE"
+          echo "Using:"
+          echo "$CONFIG_FILE"
 
-      # ============================================================
-      # 6. Apply custom configuration
-      # ============================================================
+      # ==========================================================
+      # 6. Apply configuration
+      # ==========================================================
       - name: Configure kernel
         shell: bash
         run: |
-          set -eux
+          set -euo pipefail
 
           cd linux
 
-          cp ../config/config-6.18-minta-ntsync .config
+          cp "../config/config-6.18-minta-ntsync" .config
 
           echo "Running olddefconfig..."
 
           make olddefconfig
 
           echo
-          echo "=== Important configuration ==="
-
+          echo "Important configuration:"
           grep -E \
-            '^(CONFIG_NTSYNC|CONFIG_X86_64|CONFIG_64BIT|CONFIG_HZ|CONFIG_SYSTEM_TRUSTED_KEYS|CONFIG_SYSTEM_REVOCATION_KEYS)=' \
+            '^(CONFIG_NTSYNC|CONFIG_64BIT|CONFIG_X86_64|CONFIG_HZ)=' \
             .config || true
 
-          echo
-          echo "=== NTSYNC ==="
-
-          if grep -q '^CONFIG_NTSYNC=y$' .config; then
-            echo "CONFIG_NTSYNC=y confirmed."
-          else
-            echo "ERROR: CONFIG_NTSYNC=y is not enabled."
-            exit 1
-          fi
-
-      # ============================================================
-      # 7. Verify configuration after olddefconfig
-      # ============================================================
-      - name: Verify kernel configuration
+      # ==========================================================
+      # 7. Force build-environment-specific options
+      #
+      # Avoid requiring Canonical's signing certificate files.
+      # ==========================================================
+      - name: Prepare kernel configuration
         shell: bash
         run: |
-          set -eux
+          set -euo pipefail
+
+          cd linux
+
+          ./scripts/config \
+            --disable SYSTEM_TRUSTED_KEYS \
+            --disable SYSTEM_REVOCATION_KEYS
+
+          make olddefconfig
+
+      # ==========================================================
+      # 8. Verify configuration
+      # ==========================================================
+      - name: Verify configuration
+        shell: bash
+        run: |
+          set -euo pipefail
 
           cd linux
 
@@ -170,41 +174,55 @@ jobs:
           make -s kernelversion
 
           echo
+          echo "Kernel release:"
+          make -s kernelrelease
+
+          echo
           echo "NTSYNC:"
           grep '^CONFIG_NTSYNC=' .config
 
+          if ! grep -q '^CONFIG_NTSYNC=y$' .config; then
+            echo "::error::CONFIG_NTSYNC=y is not enabled!"
+            exit 1
+          fi
+
           echo
-          echo "64-bit:"
+          echo "64-bit configuration:"
           grep -E '^CONFIG_(64BIT|X86_64)=' .config || true
 
-          test "$(grep '^CONFIG_NTSYNC=' .config)" = "CONFIG_NTSYNC=y"
+          echo
+          echo "Certificate configuration:"
+          grep -E '^CONFIG_SYSTEM_(TRUSTED_KEYS|REVOCATION_KEYS)=' .config || true
 
-      # ============================================================
-      # 8. Build kernel + modules
+          echo
+          echo "CONFIG_NTSYNC=y confirmed."
+
+      # ==========================================================
+      # 9. Build kernel
       #
-      # IMPORTANT:
-      # This is separate from bindeb-pkg.
-      # If packaging fails later, this stage remains successful.
-      # ============================================================
+      # No packaging yet.
+      # First make absolutely sure the kernel itself builds.
+      # ==========================================================
       - name: Build kernel
         shell: bash
         run: |
-          set -eux
+          set -euo pipefail
 
           cd linux
 
           echo "========================================"
-          echo " Starting kernel build"
+          echo " Building Linux kernel"
           echo "========================================"
 
-          echo "Kernel:"
-          make -s kernelversion
+          echo "Version:"
+          make -s kernelrelease
 
+          echo
           echo "CPU threads:"
           nproc
 
           echo
-          echo "Compiling..."
+          echo "Starting build..."
 
           make \
             -j"$(nproc)" \
@@ -214,65 +232,70 @@ jobs:
 
           echo
           echo "========================================"
-          echo " Kernel build completed"
+          echo " Kernel build successful"
           echo "========================================"
 
           test -f arch/x86/boot/bzImage
 
           ls -lh arch/x86/boot/bzImage
 
-      # ============================================================
-      # 9. Save kernel configuration
-      # ============================================================
-      - name: Save kernel build metadata
+      # ==========================================================
+      # 10. Prepare kernel artifact
+      # ==========================================================
+      - name: Prepare kernel artifact
         shell: bash
         run: |
-          set -eux
+          set -euo pipefail
 
           cd linux
 
-          mkdir -p ../kernel-artifact
+          rm -rf "$GITHUB_WORKSPACE/kernel-artifact"
+          mkdir -p "$GITHUB_WORKSPACE/kernel-artifact"
 
           cp arch/x86/boot/bzImage \
-            ../kernel-artifact/bzImage
+            "$GITHUB_WORKSPACE/kernel-artifact/bzImage"
 
           cp .config \
-            ../kernel-artifact/.config
+            "$GITHUB_WORKSPACE/kernel-artifact/config"
 
           make -s kernelrelease \
-            > ../kernel-artifact/kernelrelease.txt
+            > "$GITHUB_WORKSPACE/kernel-artifact/kernelrelease.txt"
 
-          git describe --always --dirty \
-            > ../kernel-artifact/kernel-source.txt
+          echo "Linux ${KERNEL_VERSION}" \
+            > "$GITHUB_WORKSPACE/kernel-artifact/source.txt"
 
-          echo "Kernel release:"
-          cat ../kernel-artifact/kernelrelease.txt
+          echo "LOCALVERSION=${LOCALVERSION}" \
+            >> "$GITHUB_WORKSPACE/kernel-artifact/source.txt"
 
-      # ============================================================
-      # 10. Upload kernel immediately
-      #
-      # This happens BEFORE Debian packaging.
-      # ============================================================
+          echo
+          echo "Artifact:"
+          find "$GITHUB_WORKSPACE/kernel-artifact" \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f %s bytes\n'
+
+      # ==========================================================
+      # 11. Upload kernel artifact immediately
+      # ==========================================================
       - name: Upload kernel artifact
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ env.KERNEL_VERSION }}-ntsync-kernel
-          retention-days: 14
-          if-no-files-found: error
           path: kernel-artifact/
+          if-no-files-found: error
+          retention-days: 30
 
-      # ============================================================
-      # 11. Stage modules separately
-      # ============================================================
-      - name: Stage kernel modules
+      # ==========================================================
+      # 12. Stage modules
+      # ==========================================================
+      - name: Install modules into staging directory
         shell: bash
         run: |
-          set -eux
+          set -euo pipefail
 
           cd linux
 
-          rm -rf ../modules-artifact
+          rm -rf "$GITHUB_WORKSPACE/modules-artifact"
 
           make \
             modules_install \
@@ -280,33 +303,32 @@ jobs:
             LOCALVERSION="${LOCALVERSION}"
 
           echo
-          echo "Module size:"
-          du -sh ../modules-artifact
+          echo "Modules:"
+          du -sh "$GITHUB_WORKSPACE/modules-artifact"
 
-      # ============================================================
-      # 12. Upload modules
-      # ============================================================
-      - name: Upload module artifact
-        if: success()
+      # ==========================================================
+      # 13. Upload modules
+      # ==========================================================
+      - name: Upload modules artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ env.KERNEL_VERSION }}-ntsync-modules
-          retention-days: 14
-          if-no-files-found: error
           path: modules-artifact/
+          if-no-files-found: error
+          retention-days: 30
 
-      # ============================================================
-      # 13. Attempt Debian packaging
+      # ==========================================================
+      # 14. Build Debian packages
       #
-      # Packaging is allowed to fail without destroying the
-      # successful kernel artifacts.
-      # ============================================================
+      # This is intentionally AFTER the kernel artifact upload.
+      # If this fails, the kernel is still available.
+      # ==========================================================
       - name: Build Debian packages
         id: deb
         continue-on-error: true
         shell: bash
         run: |
-          set -eux
+          set -euo pipefail
 
           cd linux
 
@@ -315,58 +337,72 @@ jobs:
           echo "========================================"
 
           make \
+            -j"$(nproc)" \
             bindeb-pkg \
             LOCALVERSION="${LOCALVERSION}"
 
-      # ============================================================
-      # 14. List generated packages
-      # ============================================================
-      - name: List Debian packages
+      # ==========================================================
+      # 15. Collect Debian packages
+      # ==========================================================
+      - name: Collect Debian packages
         if: steps.deb.outcome == 'success'
         shell: bash
         run: |
-          set -eux
+          set -euo pipefail
 
-          echo "Generated packages:"
+          mkdir -p deb-artifact
 
           find "$GITHUB_WORKSPACE" \
-            -maxdepth 2 \
+            -maxdepth 3 \
             -type f \
-            \( -name '*.deb' -o -name '*.changes' -o -name '*.dsc' \) \
-            -print
+            -name '*.deb' \
+            -exec cp {} deb-artifact/ \;
 
-      # ============================================================
-      # 15. Upload Debian packages if successful
-      # ============================================================
-      - name: Upload Debian package artifact
+          echo
+          echo "Generated Debian packages:"
+          find deb-artifact \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f %s bytes\n'
+
+          test -n "$(find deb-artifact -maxdepth 1 -name '*.deb' -print -quit)"
+
+      # ==========================================================
+      # 16. Upload Debian packages
+      # ==========================================================
+      - name: Upload Debian packages
         if: steps.deb.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ env.KERNEL_VERSION }}-ntsync-debs
-          retention-days: 30
+          path: deb-artifact/
           if-no-files-found: error
-          path: |
-            *.deb
-            *.changes
-            *.dsc
-            ../*.deb
-            ../*.changes
-            ../*.dsc
+          retention-days: 30
 
-      # ============================================================
-      # 16. Report packaging status
-      # ============================================================
-      - name: Report packaging result
+      # ==========================================================
+      # 17. Final status
+      # ==========================================================
+      - name: Final status
         shell: bash
         run: |
           if [ "${{ steps.deb.outcome }}" = "success" ]; then
+            echo
             echo "========================================"
-            echo " Debian packaging succeeded."
+            echo " ALL BUILD STAGES SUCCEEDED"
             echo "========================================"
+            echo
+            echo "Kernel:      SUCCESS"
+            echo "Modules:     SUCCESS"
+            echo "Debian pkg:  SUCCESS"
           else
+            echo
             echo "========================================"
-            echo " Kernel build succeeded."
-            echo " Debian packaging failed."
-            echo " Kernel artifacts are already safe."
+            echo " KERNEL BUILD SUCCEEDED"
             echo "========================================"
+            echo
+            echo "Kernel:      SUCCESS"
+            echo "Modules:     SUCCESS"
+            echo "Debian pkg:  FAILED"
+            echo
+            echo "The kernel and modules artifacts are safe."
           fi
