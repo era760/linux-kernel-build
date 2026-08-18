@@ -16,7 +16,7 @@ env:
 
 jobs:
   build-kernel:
-    name: Build Linux ${{ env.KERNEL_VERSION }} + NTSYNC
+    name: name: Build custom Linux kernel
     runs-on: ubuntu-24.04
 
     steps:
