@@ -2,6 +2,7 @@ name: Build Linux Kernel
 
 on:
   workflow_dispatch:
+
   push:
     paths:
       - "config/**"
@@ -9,21 +10,27 @@ on:
 
 jobs:
   build:
+    name: Build Linux 6.18 with ntsync
     runs-on: ubuntu-24.04
 
+    env:
+      KERNEL_VERSION: "6.18"
+      LOCALVERSION: "-ntsync"
+
     steps:
-      - name: Checkout configuration
+      # ------------------------------------------------------------
+      # Checkout our repository
+      # ------------------------------------------------------------
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Clone Linux 6.18
-        run: |
-          git clone --depth=1 --branch v6.18 \
-            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
-            linux
-
+      # ------------------------------------------------------------
+      # Install kernel build dependencies
+      # ------------------------------------------------------------
       - name: Install build dependencies
         run: |
           sudo apt-get update
+
           sudo apt-get install -y \
             build-essential \
             bc \
@@ -34,28 +41,122 @@ jobs:
             dwarves \
             fakeroot \
             dpkg-dev \
-            rsync
+            rsync \
+            cpio \
+            kmod
 
+      # ------------------------------------------------------------
+      # Clone Linux kernel
+      # ------------------------------------------------------------
+      - name: Clone Linux kernel
+        run: |
+          git clone \
+            --depth=1 \
+            --branch "v${KERNEL_VERSION}" \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+            linux
+
+          cd linux
+
+          echo "Kernel source:"
+          git describe --tags --always
+
+      # ------------------------------------------------------------
+      # Apply configuration
+      # ------------------------------------------------------------
       - name: Configure kernel
         run: |
           cd linux
 
           cp ../config/config-6.18-ubuntu2204-ntsync .config
 
+          echo "Running olddefconfig..."
           make olddefconfig
 
-          grep '^CONFIG_NTSYNC=' .config
+          echo
+          echo "=== Important configuration ==="
+          grep '^CONFIG_NTSYNC=' .config || true
+          grep '^CONFIG_PREEMPT=' .config || true
+          grep '^CONFIG_HZ=' .config || true
+          echo
 
+          if ! grep -q '^CONFIG_NTSYNC=y$' .config; then
+            echo "ERROR: CONFIG_NTSYNC=y is not enabled!"
+            exit 1
+          fi
+
+          echo "CONFIG_NTSYNC=y confirmed."
+
+      # ------------------------------------------------------------
+      # Build kernel
+      # ------------------------------------------------------------
+      - name: Build kernel
+        run: |
+          cd linux
+
+          echo "========================================"
+          echo " Starting Linux kernel build"
+          echo "========================================"
+
+          echo "CPU cores:"
+          nproc
+
+          echo
+          echo "Kernel version:"
+          make -s kernelversion
+
+          echo
+          echo "Starting compilation..."
+
+          make -j"$(nproc)" \
+            LOCALVERSION="${LOCALVERSION}" \
+            bzImage \
+            modules
+
+          echo
+          echo "========================================"
+          echo " Kernel build finished"
+          echo "========================================"
+
+      # ------------------------------------------------------------
+      # Build Debian packages
+      # ------------------------------------------------------------
       - name: Build Debian packages
         run: |
           cd linux
 
-          make -j"$(nproc)" bindeb-pkg \
-            LOCALVERSION=-ntsync
+          echo "========================================"
+          echo " Building Debian packages"
+          echo "========================================"
 
+          make -j"$(nproc)" \
+            LOCALVERSION="${LOCALVERSION}" \
+            bindeb-pkg
+
+          echo
+          echo "========================================"
+          echo " Debian package build finished"
+          echo "========================================"
+
+      # ------------------------------------------------------------
+      # Show generated packages
+      # ------------------------------------------------------------
+      - name: List generated packages
+        run: |
+          echo "Generated packages:"
+          ls -lh ./*.deb || true
+
+          echo
+          echo "All files in parent directory:"
+          ls -lh . ../ | head -100
+
+      # ------------------------------------------------------------
+      # Upload Debian packages
+      # ------------------------------------------------------------
       - name: Upload kernel packages
         uses: actions/upload-artifact@v4
         with:
           name: linux-6.18-ntsync
-          path: |
-            *.deb
+          path: "*.deb"
+          if-no-files-found: error
+          retention-days: 14
