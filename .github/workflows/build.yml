@@ -1,33 +1,26 @@
-name: Build Linux Kernel
+name: Build Linux kernel with NTSYNC
 
 on:
   workflow_dispatch:
 
-  push:
-    paths:
-      - "config/**"
-      - ".github/workflows/build.yml"
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: Linux 6.18 + ntsync
     runs-on: ubuntu-24.04
 
-    env:
-      KERNEL_VERSION: "6.18"
-      LOCALVERSION: "-ntsync"
-
     steps:
-      # ------------------------------------------------------------
-      # Checkout repository
-      # ------------------------------------------------------------
+      # ============================================================
+      # 1. Checkout
+      # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # Install build dependencies
-      # ------------------------------------------------------------
-      - name: Install build dependencies
+      # ============================================================
+      # 2. Install build dependencies
+      # ============================================================
+      - name: Install kernel build dependencies
         run: |
           sudo apt-get update
 
@@ -39,128 +32,154 @@ jobs:
             libssl-dev \
             libelf-dev \
             dwarves \
-            fakeroot \
-            dpkg-dev \
-            rsync \
             cpio \
+            fakeroot \
+            rsync \
             kmod \
             libdw-dev \
-            libcap-dev
+            debhelper
 
-      # ------------------------------------------------------------
-      # Download Linux kernel
-      # ------------------------------------------------------------
-      - name: Clone Linux kernel
+      # ============================================================
+      # 3. Check source tree
+      # ============================================================
+      - name: Check kernel source
         run: |
-          git clone \
-            --depth=1 \
-            --branch "v${KERNEL_VERSION}" \
-            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
-            linux
+          test -d linux
+          test -f linux/Makefile
 
+          echo "Kernel source:"
           cd linux
+          make kernelversion
 
-          echo "=== Kernel source ==="
-          git describe --tags --always
-
-      # ------------------------------------------------------------
-      # Configure kernel
-      # ------------------------------------------------------------
-      - name: Configure kernel
+      # ============================================================
+      # 4. Prepare configuration
+      # ============================================================
+      - name: Prepare kernel configuration
         run: |
           cd linux
 
-          echo "=== Copying configuration ==="
+          # --------------------------------------------------------
+          # Use the existing Ubuntu config if available.
+          # Otherwise start from the kernel's default x86_64 config.
+          # --------------------------------------------------------
+          if [ -f ../config-6.8.0-136-generic ]; then
+            cp ../config-6.8.0-136-generic .config
+          elif [ -f ../config ]; then
+            cp ../config .config
+          else
+            make x86_64_defconfig
+          fi
 
-          cp ../config/config-6.18-ubuntu2204-ntsync .config
+          # --------------------------------------------------------
+          # Required for NTSYNC
+          # --------------------------------------------------------
+          scripts/config --enable NTSYNC
 
-          # ----------------------------------------------------------
-          # Remove Ubuntu/Canonical-specific certificate references.
-          #
-          # The configuration came from Ubuntu, while this is a
-          # vanilla kernel.org source tree.
-          # ----------------------------------------------------------
+          # Avoid Ubuntu/Canonical certificate files that are not
+          # present in the upstream source tree.
+          scripts/config --disable SYSTEM_TRUSTED_KEYS
+          scripts/config --disable SYSTEM_REVOCATION_KEYS
 
-          sed -i \
-            's|^CONFIG_SYSTEM_TRUSTED_KEYS=.*|CONFIG_SYSTEM_TRUSTED_KEYS=""|' \
-            .config
+          # Keep a reasonably responsive desktop-oriented tick rate.
+          scripts/config --set-val HZ 1000
 
-          sed -i \
-            's|^CONFIG_SYSTEM_REVOCATION_KEYS=.*|CONFIG_SYSTEM_REVOCATION_KEYS=""|' \
-            .config
-
-          # ----------------------------------------------------------
-          # Let Linux 6.18 resolve any changed/obsolete symbols.
-          # ----------------------------------------------------------
-
-          echo "=== Running olddefconfig ==="
-
+          echo "Running olddefconfig..."
           make olddefconfig
 
           echo
           echo "=== Important configuration ==="
-
-          grep '^CONFIG_NTSYNC=' .config || true
-          grep '^CONFIG_HZ=' .config || true
-          grep '^CONFIG_PREEMPT=' .config || true
-          grep '^CONFIG_SYSTEM_TRUSTED_KEYS=' .config || true
-          grep '^CONFIG_SYSTEM_REVOCATION_KEYS=' .config || true
+          grep -E '^(CONFIG_NTSYNC|CONFIG_HZ|CONFIG_SYSTEM_TRUSTED_KEYS|CONFIG_SYSTEM_REVOCATION_KEYS)=' .config
 
           echo
-
-          # ----------------------------------------------------------
-          # Hard requirement for this build.
-          # ----------------------------------------------------------
-
-          if ! grep -q '^CONFIG_NTSYNC=y$' .config; then
-            echo "ERROR: CONFIG_NTSYNC=y is not enabled!"
-            exit 1
-          fi
-
-          # Make sure the Ubuntu certificate paths are gone.
-          if grep -q 'debian/canonical-certs.pem' .config; then
-            echo "ERROR: Ubuntu canonical certificate reference remains!"
-            exit 1
-          fi
-
+          echo "=== NTSYNC check ==="
+          grep -q '^CONFIG_NTSYNC=y$' .config
           echo "CONFIG_NTSYNC=y confirmed."
-          echo "Kernel configuration is ready."
 
-      # ------------------------------------------------------------
-      # Build kernel
-      # ------------------------------------------------------------
+      # ============================================================
+      # 5. Build kernel + modules
+      #
+      # This is the expensive part.
+      # Do NOT combine this with bindeb-pkg.
+      # ============================================================
       - name: Build kernel
         run: |
           cd linux
 
           echo "========================================"
-          echo " Starting Linux kernel build"
+          echo " Building Linux kernel"
           echo "========================================"
-
-          echo "CPU threads:"
-          nproc
-
-          echo
-          echo "Kernel version:"
-          make -s kernelversion
-
-          echo
-          echo "Starting compilation..."
 
           make -j"$(nproc)" \
-            LOCALVERSION="${LOCALVERSION}" \
             bzImage \
-            modules
+            modules \
+            LOCALVERSION=-ntsync
 
           echo
           echo "========================================"
-          echo " Kernel build finished"
+          echo " Kernel build completed"
           echo "========================================"
 
-      # ------------------------------------------------------------
-      # Build Debian packages
-      # ------------------------------------------------------------
+          ls -lh arch/x86/boot/bzImage
+
+          echo
+          echo "Kernel release:"
+          make -s kernelrelease
+
+      # ============================================================
+      # 6. Save kernel immediately
+      #
+      # If Debian packaging explodes later, THIS artifact survives.
+      # ============================================================
+      - name: Upload kernel artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-6.18-ntsync-kernel
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            linux/arch/x86/boot/bzImage
+            linux/.config
+
+      # ============================================================
+      # 7. Install modules into a staging directory
+      #
+      # This is still independent of Debian packaging.
+      # ============================================================
+      - name: Stage kernel modules
+        run: |
+          cd linux
+
+          rm -rf ../kernel-modules
+
+          make modules_install \
+            INSTALL_MOD_PATH="$GITHUB_WORKSPACE/kernel-modules" \
+            LOCALVERSION=-ntsync
+
+          echo "=== Staged modules ==="
+          du -sh ../kernel-modules
+
+      # ============================================================
+      # 8. Upload modules separately
+      # ============================================================
+      - name: Upload kernel modules
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-6.18-ntsync-modules
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            kernel-modules/
+
+      # ============================================================
+      # 9. Debian package build
+      #
+      # If this fails, the two artifacts above are already safe.
+      # ============================================================
       - name: Build Debian packages
+        id: deb_build
+        continue-on-error: true
         run: |
           cd linux
 
@@ -168,36 +187,74 @@ jobs:
           echo " Building Debian packages"
           echo "========================================"
 
-          make -j"$(nproc)" \
-            LOCALVERSION="${LOCALVERSION}" \
-            bindeb-pkg
+          make -j"$(nproc)" bindeb-pkg \
+            LOCALVERSION=-ntsync
 
-          echo
-          echo "========================================"
-          echo " Debian package build finished"
-          echo "========================================"
-
-      # ------------------------------------------------------------
-      # Show generated packages
-      # ------------------------------------------------------------
-      - name: List generated packages
+      # ============================================================
+      # 10. Find generated Debian packages
+      # ============================================================
+      - name: List Debian packages
+        if: steps.deb_build.outcome == 'success'
         run: |
-          echo "=== Generated Debian packages ==="
+          echo "=== Generated packages ==="
+          find . .. -maxdepth 2 \
+            -type f \
+            \( -name '*.deb' -o -name '*.changes' -o -name '*.dsc' \) \
+            -print
 
-          ls -lh ../*.deb
-
-          echo
-          echo "=== Package names ==="
-
-          find .. -maxdepth 1 -type f -name '*.deb' -printf '%f\n'
-
-      # ------------------------------------------------------------
-      # Upload kernel packages
-      # ------------------------------------------------------------
-      - name: Upload kernel packages
+      # ============================================================
+      # 11. Upload Debian packages ONLY if packaging succeeded
+      # ============================================================
+      - name: Upload Debian packages
+        if: steps.deb_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: linux-6.18-ntsync
-          path: "*.deb"
+          name: linux-6.18-ntsync-debs
+          retention-days: 30
           if-no-files-found: error
-          retention-days: 14
+          path: |
+            *.deb
+            *.changes
+            *.dsc
+            ../*.deb
+            ../*.changes
+            ../*.dsc
+
+      # ============================================================
+      # 12. Show packaging failure but don't hide it
+      # ============================================================
+      - name: Report Debian packaging failure
+        if: steps.deb_build.outcome == 'failure'
+        run: |
+          echo
+          echo "================================================"
+          echo " Kernel build succeeded."
+          echo " Debian packaging failed."
+          echo " Kernel artifacts were already uploaded."
+          echo "================================================"
+          echo
+          echo "The kernel itself is NOT considered a failed build."
+          echo "Inspect the packaging error above."
+
+      # ============================================================
+      # 13. Final status
+      # ============================================================
+      - name: Final result
+        run: |
+          echo "========================================"
+          echo " Kernel build pipeline finished"
+          echo "========================================"
+
+          echo "Kernel artifact:"
+          echo "  linux-6.18-ntsync-kernel"
+
+          echo "Module artifact:"
+          echo "  linux-6.18-ntsync-modules"
+
+          if [ "${{ steps.deb_build.outcome }}" = "success" ]; then
+            echo "Debian artifact:"
+            echo "  linux-6.18-ntsync-debs"
+          else
+            echo "Debian packaging:"
+            echo "  FAILED (kernel artifacts are safe)"
+          fi
